@@ -1,8 +1,8 @@
 name: wd-feed-cache
-# Fetch the WaistDear feed from GitHub's (non-banned) egress IP and publish a reduced
-# cache to the `cache` branch. Modal's Orlando stock sync reads it via raw.githubusercontent
-# because WaistDear hard-rate-limits Modal's datacenter IP. Uses the repo's own GITHUB_TOKEN
-# (no PAT). See build_wd_cache.py for the output contract.
+# Fetch the WaistDear + VRActive feeds from GitHub's (non-banned) egress IP and publish
+# reduced caches to the `cache` branch. Modal's Orlando stock sync reads them via
+# raw.githubusercontent because both suppliers hard-rate-limit Modal's datacenter IP.
+# Uses the repo's own GITHUB_TOKEN (no PAT). See build_wd_cache.py for the output contract.
 on:
   schedule:
     - cron: '*/30 * * * *'
@@ -19,16 +19,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch WaistDear feed -> wd_feed_cache.json
+      - name: Fetch supplier feeds -> wd_feed_cache.json + vr_feed_cache.json
         run: python3 build_wd_cache.py
       - name: Publish to cache branch (single force-pushed commit)
         run: |
-          test -s wd_feed_cache.json || { echo "cache file missing/empty"; exit 1; }
-          COUNT=$(python3 -c "import json;print(json.load(open('wd_feed_cache.json'))['count'])")
+          test -s wd_feed_cache.json || { echo "wd cache missing/empty"; exit 1; }
+          test -s vr_feed_cache.json || { echo "vr cache missing/empty"; exit 1; }
+          WD=$(python3 -c "import json;print(json.load(open('wd_feed_cache.json'))['count'])")
+          VR=$(python3 -c "import json;print(json.load(open('vr_feed_cache.json'))['count'])")
           git config user.name "wd-feed-cache"
           git config user.email "actions@github.com"
           git checkout --orphan cache-tmp
           git reset
-          git add wd_feed_cache.json
-          git commit -m "wd feed cache: count=${COUNT}"
+          git add wd_feed_cache.json vr_feed_cache.json
+          git commit -m "feed cache: wd=${WD} vr=${VR}"
           git push -f origin cache-tmp:cache

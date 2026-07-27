@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Fetch the WaistDear feed and write a reduced cache JSON for the Modal sync.
+"""Fetch supplier feeds (WaistDear + VRActive) and write reduced cache JSONs for the
+Modal Orlando stock sync.
 
-WaistDear hard-rate-limits Modal's datacenter egress IP (429 local_rate_limited,
-verified 2026-07-24). This runs from a NON-banned IP (GitHub Actions cron, see
-.github/workflows/wd-feed-cache.yml) and publishes the cache to the `wd-feed-cache`
-branch; Modal reads it from raw.githubusercontent instead of hitting waistdear.com.
+Both suppliers hard-rate-limit Modal's datacenter egress IP (429 local_rate_limited).
+This runs from a NON-banned IP (GitHub Actions cron) and publishes one cache file per
+supplier to the `cache` branch; Modal reads them from raw.githubusercontent.
 
-Output shape is the CONTRACT consumed by app._fetch_waistdear_cache():
+Output shape per file is the CONTRACT consumed by app._fetch_supplier_cache():
   {"fetched_at": ISO8601, "count": N, "products": [{"handle", "variants":[{"sku","available"}]}]}
-Only the fields Modal's WaistDear feed path consumes are kept (handle + variant
-sku/available, order preserved for the scraper's positional match).
+Only the fields Modal's feed path consumes are kept (handle + variant sku/available,
+order preserved for the scraper's positional match).
 
-Exits non-zero (does NOT overwrite the cache) if the feed is below MIN_PRODUCTS, so
-a partial/blocked fetch can never publish a catalog-zeroing snapshot.
+ALL-OR-NOTHING publish: if ANY supplier is below its floor (blocked/partial fetch),
+NOTHING is written and the script exits non-zero, so the workflow skips the publish
+step and the last-good cache on the `cache` branch is preserved (never publish a
+catalog-zeroing snapshot).
 """
 import json
 import sys
@@ -21,10 +23,16 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-BASE = "https://www.waistdear.com/collections/all/products.json?limit=250"
-MIN_PRODUCTS = 150
 MAX_PAGES = 50
-OUT_PATH = "wd_feed_cache.json"
+
+SUPPLIERS = [
+    {"key": "waistdear",
+     "base": "https://www.waistdear.com/collections/all/products.json?limit=250",
+     "min": 150, "out": "wd_feed_cache.json"},
+    {"key": "vractive",
+     "base": "https://www.vractivewholesale.com/products.json?limit=250",
+     "min": 40, "out": "vr_feed_cache.json"},
+]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,8 +45,8 @@ HEADERS = {
 }
 
 
-def _get_page(page: int) -> list:
-    req = urllib.request.Request(f"{BASE}&page={page}", headers=HEADERS)
+def _get_page(base: str, page: int) -> list:
+    req = urllib.request.Request(f"{base}&page={page}", headers=HEADERS)
     for attempt in range(4):
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
@@ -53,27 +61,24 @@ def _get_page(page: int) -> list:
                 continue
             raise
         except (urllib.error.URLError, TimeoutError) as e:
-            # DNS / connection reset / socket timeout are transient; retry, else fail
-            # the run (build_wd_cache only writes on success, so no bad cache ships).
             if attempt < 3:
-                print(f"  transient error page {page} ({type(e).__name__}); retry", file=sys.stderr)
+                print(f"  transient error ({type(e).__name__}); retry", file=sys.stderr)
                 time.sleep(5)
                 continue
             raise
     return []
 
 
-def main() -> int:
+def _fetch_supplier(base: str) -> list:
     products: list = []
     page = 1
     while page <= MAX_PAGES:
-        batch = _get_page(page)
+        batch = _get_page(base, page)
         products.extend(batch)
         if len(batch) < 250:
             break
         page += 1
-
-    reduced = [
+    return [
         {
             "handle": p.get("handle"),
             "variants": [
@@ -84,21 +89,35 @@ def main() -> int:
         for p in products
     ]
 
-    if len(reduced) < MIN_PRODUCTS:
-        print(f"ERROR: only {len(reduced)} products (< {MIN_PRODUCTS}); NOT writing cache",
-              file=sys.stderr)
-        return 1
 
-    out = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(reduced),
-        "products": reduced,
-    }
-    with open(OUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(out, f, separators=(",", ":"))
-    avail = sum(1 for p in reduced for v in p["variants"] if v["available"])
-    total = sum(len(p["variants"]) for p in reduced)
-    print(f"wrote {OUT_PATH}: {len(reduced)} products, {total} variants, {avail} available")
+def main() -> int:
+    built = []  # (out_path, payload)
+    for s in SUPPLIERS:
+        try:
+            reduced = _fetch_supplier(s["base"])
+        except Exception as e:
+            print(f"ERROR: {s['key']} fetch failed ({type(e).__name__}: {e})", file=sys.stderr)
+            return 1
+        if len(reduced) < s["min"]:
+            print(f"ERROR: {s['key']} only {len(reduced)} products (< {s['min']}); "
+                  f"NOT publishing (last-good preserved)", file=sys.stderr)
+            return 1
+        avail = sum(1 for p in reduced for v in p["variants"] if v["available"])
+        total = sum(len(p["variants"]) for p in reduced)
+        if total and (avail / total) < 0.05:
+            print(f"ERROR: {s['key']} availability implausibly low: {avail}/{total} < 5% "
+                  f"(suspected feed-shape bug); NOT publishing (last-good preserved)", file=sys.stderr)
+            return 1
+        payload = {"fetched_at": datetime.now(timezone.utc).isoformat(),
+                   "count": len(reduced), "products": reduced}
+        built.append((s["out"], payload))
+        print(f"{s['key']}: {len(reduced)} products, {total} variants, {avail} available")
+
+    # Every supplier passed its floor -> write all files (only after all validated).
+    for out_path, payload in built:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        print(f"wrote {out_path}")
     return 0
 
 
